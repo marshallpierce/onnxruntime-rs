@@ -1,6 +1,6 @@
 //! Module containing session types
 
-use std::{convert::TryInto as _, ffi::CString, fmt::Debug, path::Path};
+use std::{convert::TryInto as _, ffi::CString, fmt::Debug, path::Path, ptr, rc};
 
 #[cfg(not(target_family = "windows"))]
 use std::os::unix::ffi::OsStrExt;
@@ -21,7 +21,10 @@ use crate::{
     error::{call_ort, status_to_result, NonMatchingDimensionsError, OrtError, Result},
     g_ort,
     memory::MemoryInfo,
-    tensor::{DynOrtTensor, OrtTensor, TensorElementDataType, TypeToTensorElementDataType},
+    tensor::{
+        extract_tensor_data, ort_owned_tensor::TensorPointerHolder, DynOrtTensor, OrtTensor,
+        TensorElementDataType, TypeToTensorElementDataType,
+    },
     AllocatorType, GraphOptimizationLevel, MemType,
 };
 
@@ -435,9 +438,13 @@ impl<'a> Session<'a> {
         let outputs: Result<Vec<DynOrtTensor<ndarray::Dim<ndarray::IxDynImpl>>>> =
             output_tensor_ptrs
                 .into_iter()
+                // ensure they'll all be dropped at some point
+                .map(|ptr| rc::Rc::new(TensorPointerHolder { tensor_ptr: ptr }))
                 .map(|tensor_ptr| {
+                    assert_ne!(tensor_ptr.tensor_ptr, ptr::null_mut());
+
                     let (dims, data_type, len) = unsafe {
-                        call_with_tensor_info(tensor_ptr, |tensor_info_ptr| {
+                        call_with_tensor_info(tensor_ptr.tensor_ptr, |tensor_info_ptr| {
                             get_tensor_dimensions(tensor_info_ptr)
                                 .map(|dims| dims.iter().map(|&n| n as usize).collect::<Vec<_>>())
                                 .and_then(|dims| {
@@ -466,7 +473,7 @@ impl<'a> Session<'a> {
                     }?;
 
                     Ok(DynOrtTensor::new(
-                        tensor_ptr,
+                        extract_tensor_data(tensor_ptr, data_type, len)?,
                         memory_info_ref,
                         ndarray::IxDyn(&dims),
                         len,

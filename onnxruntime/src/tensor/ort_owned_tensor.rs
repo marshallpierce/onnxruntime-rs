@@ -1,6 +1,6 @@
 //! Module containing tensor with memory owned by the ONNX Runtime
 
-use std::{fmt::Debug, ops::Deref, ptr, rc, result};
+use std::{fmt::Debug, ops::Deref, ptr, result};
 
 use ndarray::ArrayView;
 use thiserror::Error;
@@ -9,10 +9,9 @@ use tracing::debug;
 use onnxruntime_sys as sys;
 
 use crate::{
-    error::call_ort,
     g_ort,
     memory::MemoryInfo,
-    tensor::{TensorData, TensorDataToType, TensorElementDataType},
+    tensor::{TensorData, TensorDataToType, TensorElementDataType, TensorTypedData},
     OrtError,
 };
 
@@ -46,9 +45,7 @@ pub struct DynOrtTensor<'m, D>
 where
     D: ndarray::Dimension,
 {
-    // TODO could this also hold a Vec<u8> for strings so that the extracted tensor could then
-    // hold a Vec<&str>?
-    tensor_ptr_holder: rc::Rc<TensorPointerHolder>,
+    tensor_data: TensorData,
     memory_info: &'m MemoryInfo,
     shape: D,
     tensor_element_len: usize,
@@ -60,14 +57,14 @@ where
     D: ndarray::Dimension,
 {
     pub(crate) fn new(
-        tensor_ptr: *mut sys::OrtValue,
+        tensor_data: TensorData,
         memory_info: &'m MemoryInfo,
         shape: D,
         tensor_element_len: usize,
         data_type: TensorElementDataType,
     ) -> DynOrtTensor<'m, D> {
         DynOrtTensor {
-            tensor_ptr_holder: rc::Rc::from(TensorPointerHolder { tensor_ptr }),
+            tensor_data,
             memory_info,
             shape,
             tensor_element_len,
@@ -88,12 +85,12 @@ where
     ///
     /// An error will be returned if `T`'s ONNX type doesn't match this tensor's type, or if an
     /// onnxruntime error occurs.
-    pub fn try_extract<'t, T>(&self) -> result::Result<OrtOwnedTensor<'t, T, D>, TensorExtractError>
+    pub fn try_extract<'array, T>(
+        &self,
+    ) -> result::Result<OrtOwnedTensor<'array, T, D>, TensorExtractError>
     where
-        T: TensorDataToType + Clone + Debug,
-        'm: 't, // mem info outlives tensor
-        D: 't,  // not clear why this is needed since we clone the shape, but it doesn't make
-                // a difference in practice since the shape is extracted from the tensor
+        T: TensorDataToType<'array> + Clone + Debug,
+        'm: 'array, // mem info outlives tensor
     {
         if self.data_type != T::tensor_element_data_type() {
             Err(TensorExtractError::DataTypeMismatch {
@@ -101,26 +98,10 @@ where
                 requested: T::tensor_element_data_type(),
             })
         } else {
-            // Note: Both tensor and array will point to the same data, nothing is copied.
-            // As such, there is no need to free the pointer used to create the ArrayView.
-            assert_ne!(self.tensor_ptr_holder.tensor_ptr, ptr::null_mut());
-
-            let mut is_tensor = 0;
-            unsafe {
-                call_ort(|ort| {
-                    ort.IsTensor.unwrap()(self.tensor_ptr_holder.tensor_ptr, &mut is_tensor)
-                })
-            }
-            .map_err(OrtError::IsTensor)?;
-            assert_eq!(is_tensor, 1);
-
-            let data = T::extract_data(
+            Ok(OrtOwnedTensor::new(T::extract_typed_data(
                 self.shape.clone(),
-                self.tensor_element_len,
-                rc::Rc::clone(&self.tensor_ptr_holder),
-            )?;
-
-            Ok(OrtOwnedTensor { data })
+                &self.tensor_data,
+            )?))
         }
     }
 }
@@ -136,25 +117,34 @@ where
 /// `OrtOwnedTensor` implements the [`std::deref::Deref`](#impl-Deref) trait for ergonomic access to
 /// the underlying [`ndarray::ArrayView`](https://docs.rs/ndarray/latest/ndarray/type.ArrayView.html).
 #[derive(Debug)]
-pub struct OrtOwnedTensor<'t, T, D>
+pub struct OrtOwnedTensor<'array, T, D>
 where
-    T: TensorDataToType,
+    T: TensorDataToType<'array>,
     D: ndarray::Dimension,
 {
-    data: TensorData<'t, T, D>,
+    array_view: ndarray::ArrayView<'array, T, D>,
 }
 
-impl<'t, T, D> OrtOwnedTensor<'t, T, D>
+impl<'data, 'array, T, D> OrtOwnedTensor<'array, T, D>
 where
-    T: TensorDataToType,
-    D: ndarray::Dimension + 't,
+    T: TensorDataToType<'array>,
+    D: ndarray::Dimension + 'data,
+    'data: 'array,
 {
-    /// Produce a [ViewHolder] for the underlying data, which
-    pub fn view<'s>(&'s self) -> ViewHolder<'s, T, D>
+    fn new(data: TensorTypedData<'data, T, D>) -> OrtOwnedTensor<'array, T, D>
     where
-        't: 's, // tensor ptr can outlive the TensorData
+        'data: 'array, // underlying tensor ptr lives at least as long as TensorData
     {
-        ViewHolder::new(&self.data)
+        OrtOwnedTensor {
+            array_view: match data {
+                // we already have a view, but creating a view from a view is cheap
+                TensorTypedData::TensorPtr { array_view, .. } => array_view.view(),
+                // This view creation has to happen here, not at new()'s callsite, because
+                // a field can't be a reference to another field in the same struct. Thus, we have
+                // this separate struct to hold the view that refers to the `Array`.
+                TensorTypedData::Strings { strings } => strings.view(),
+            },
+        }
     }
 }
 
@@ -163,29 +153,29 @@ where
 // be a field in a struct. This struct exists only to hold that field.
 // Its lifetime 's is bound to the TensorData its view was created around, not the underlying tensor
 // pointer, since in the case of strings the data is the Array in the TensorData, not the pointer.
-pub struct ViewHolder<'s, T, D>
+pub struct ViewHolder<'array, T, D>
 where
-    T: TensorDataToType,
+    T: TensorDataToType<'array>,
     D: ndarray::Dimension,
 {
-    array_view: ndarray::ArrayView<'s, T, D>,
+    array_view: ndarray::ArrayView<'array, T, D>,
 }
 
-impl<'s, T, D> ViewHolder<'s, T, D>
+impl<'array, T, D> ViewHolder<'array, T, D>
 where
-    T: TensorDataToType,
+    T: TensorDataToType<'array>,
     D: ndarray::Dimension,
 {
-    fn new<'t>(data: &'s TensorData<'t, T, D>) -> ViewHolder<'s, T, D>
+    fn new<'data>(data: &'array TensorTypedData<'data, T, D>) -> ViewHolder<'array, T, D>
     where
-        't: 's, // underlying tensor ptr lives at least as long as TensorData
+        'data: 'array, // underlying tensor ptr lives at least as long as TensorData
     {
         match data {
-            TensorData::TensorPtr { array_view, .. } => ViewHolder {
+            TensorTypedData::TensorPtr { array_view, .. } => ViewHolder {
                 // we already have a view, but creating a view from a view is cheap
                 array_view: array_view.view(),
             },
-            TensorData::Strings { strings } => ViewHolder {
+            TensorTypedData::Strings { strings } => ViewHolder {
                 // This view creation has to happen here, not at new()'s callsite, because
                 // a field can't be a reference to another field in the same struct. Thus, we have
                 // this separate struct to hold the view that refers to the `Array`.
@@ -195,12 +185,12 @@ where
     }
 }
 
-impl<'t, T, D> Deref for ViewHolder<'t, T, D>
+impl<'array, T, D> Deref for ViewHolder<'array, T, D>
 where
-    T: TensorDataToType,
+    T: TensorDataToType<'array>,
     D: ndarray::Dimension,
 {
-    type Target = ArrayView<'t, T, D>;
+    type Target = ArrayView<'array, T, D>;
 
     fn deref(&self) -> &Self::Target {
         &self.array_view
@@ -221,7 +211,7 @@ pub struct TensorPointerHolder {
 impl Drop for TensorPointerHolder {
     #[tracing::instrument]
     fn drop(&mut self) {
-        debug!("Dropping OrtOwnedTensor.");
+        debug!("Dropping tensor.");
         unsafe { g_ort().ReleaseValue.unwrap()(self.tensor_ptr) }
 
         self.tensor_ptr = ptr::null_mut();

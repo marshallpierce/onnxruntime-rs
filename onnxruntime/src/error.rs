@@ -86,6 +86,9 @@ pub enum OrtError {
     /// Error occurred when extracting string data from an ONNX tensor
     #[error("Failed to get tensor string data: {0}")]
     GetStringTensorContent(OrtApiError),
+    /// Error occurred when converting data to a str
+    #[error("Data was not UTF-8: {0}")]
+    StrUtf8Error(#[from] std::str::Utf8Error),
     /// Error occurred when converting data to a String
     #[error("Data was not UTF-8: {0}")]
     StringFromUtf8Error(#[from] string::FromUtf8Error),
